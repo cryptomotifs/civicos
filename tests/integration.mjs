@@ -1,0 +1,38 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import ts from 'typescript';
+const src=await fs.readFile('lib/evidence.ts','utf8');
+const js=ts.transpileModule(src,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
+const {canonical,digest,validateClaims}=await import('data:text/javascript;base64,'+Buffer.from(js).toString('base64'));
+assert.equal(canonical({z:1,a:{b:2,a:3}}),canonical({a:{a:3,b:2},z:1}));
+assert.notEqual(await digest(canonical({x:1})),await digest(canonical({x:2})));
+const source={id:'S1',text:'The measured result was 430 residents.',availableAt:'2026-10-05'};
+const claim={text:'430 residents',status:'supported',reason:'Test',citations:[{sourceId:'S1',quote:source.text}]};
+assert.equal(validateClaims([claim],[source],'2026-10-01')[0].status,'unsupported');
+assert.equal(validateClaims([claim],[source],'2026-10-05')[0].status,'supported');
+assert.equal(validateClaims([{...claim,citations:[{sourceId:'S1',quote:'A fabricated exact quotation.'}]}],[source],'2026-10-05')[0].status,'unsupported');
+let d;const owner=crypto.randomUUID();
+async function request(b,status=200,who=owner){const r=await fetch('http://127.0.0.1:5173/api/workspace',{method:'POST',headers:{'Content-Type':'application/json','Cookie':'civicos_session='+who},body:JSON.stringify({...b,id:b.id??d?.id,revision:b.revision??d?.revision})});const result=await r.json();assert.equal(r.status,status,JSON.stringify(result));if(result.dossier)d=result.dossier;return result;}
+await request({op:'sample'});assert.equal(d.sources.length,4);
+await request({op:'freeze',reviewer:'QA',decision:'Request more evidence',rationale:'Missing evidence must be supplied.'},400);
+await request({op:'review',claimId:'C1',review:'accepted'});
+const stale=d.revision-1;await request({op:'review',claimId:'C2',review:'accepted',revision:stale},409);
+for(const id of ['C2','C3','C4'])await request({op:'review',claimId:id,review:'accepted',note:'QA verifies curated fixture assessment.'});
+await request({op:'freeze',reviewer:'CivicOS automated test',decision:'Request more evidence',rationale:'QA synthetic case: attendance and calibration need clarification.'});
+assert.equal(d.state,'frozen');const original=d.snapshots[0].hash;assert.equal(await digest(canonical(d.snapshots[0].payload)),original);
+await request({op:'cutoff',cutoff:'2026-10-10'},400);
+await request({op:'review',claimId:'C1',review:'accepted'},404,crypto.randomUUID());
+await request({op:'anchor',signature:'fake',signer:'fake'},400);
+await request({op:'amend'});await request({op:'cutoff',cutoff:'2026-10-10'});assert.equal(d.claims.length,4);assert.ok(d.claims.every(c=>c.review==='pending'));assert.equal(d.snapshots[0].hash,original);
+
+await request({op:'check'});assert.equal(d.analysis.mode,'checks');
+const eligible=d.sources.find(s=>s.availableAt<=d.cutoff);
+await request({op:'manual-claim',statement:'QA finding',status:'supported',reason:'This finding has no source.'},400);
+await request({op:'manual-claim',statement:'QA finding',status:'supported',reason:'Fabricated quotation must be rejected.',citations:[{sourceId:eligible.id,quote:'A made up passage never in the document.'}]},400);
+await request({op:'manual-claim',statement:'QA source contains quoted text.',status:'supported',reason:'The continuous quotation appears in this source.',citations:[{sourceId:eligible.id,quote:eligible.text.slice(0,100)}]});
+assert.equal(d.claims.at(-1).status,'supported');assert.equal(d.claims.at(-1).citations[0].matched,true);
+await request({op:'review',claimId:'C1',review:'accepted'});
+await request({op:'edit-claim',claimId:'C1',statement:'QA revised finding',status:'unsupported',reason:'Reviewer has revised the assessment.',citations:[]});
+assert.equal(d.claims[0].review,'pending');assert.equal(d.claims[0].status,'unsupported');
+const beforeCheck=d.claims[0].text;await request({op:'check'});assert.equal(d.claims[0].text,beforeCheck);
+console.log(JSON.stringify({passed:18,checks:['canonical hashing','tamper detection','future-source exclusion','cutoff inclusion','fabricated quotation rejection','review gate','optimistic concurrency','freeze integrity','immutable frozen version','workspace isolation','forged receipt rejected','correction preserves history','no-key evidence checks','unsupported status gate','fabricated manual citation rejected','valid manual citation accepted','editing resets review','checks preserve human findings']},null,2));
